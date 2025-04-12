@@ -1,0 +1,7 @@
+customtkinter==5.2.2
+matplotlib==3.10.1
+pandas==2.2.3
+pillow==11.1.0
+numpy==2.2.4
+yfinance>=0.2.0
+darkdetect>=0.8.0 
