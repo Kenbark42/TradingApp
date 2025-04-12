@@ -1,145 +1,203 @@
 import sqlite3
 import pandas as pd
 from datetime import datetime
+import time
+from utils import format_currency, format_percent, format_datetime
+from contextlib import contextmanager
 
 DATABASE_FILE = 'trading_simulation.db'
+
+# Cache to avoid frequent database queries for static data
+_account_cache = {"timestamp": 0, "data": None}
+_positions_cache = {"timestamp": 0, "data": None}
+CACHE_TTL = 5  # Cache time-to-live in seconds
+
+
+@contextmanager
+def get_db_connection():
+    """Context manager for database connections to ensure proper closing"""
+    conn = None
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        yield conn
+    finally:
+        if conn:
+            conn.close()
 
 
 def initialize_database():
     """Initializes the SQLite database and creates necessary tables if they don't exist."""
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
 
-    # Account table: Stores paper trading balance
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS account (
-            id INTEGER PRIMARY KEY,
-            balance REAL NOT NULL,
-            initial_balance REAL NOT NULL,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+        # Account table: Stores paper trading balance
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS account (
+                id INTEGER PRIMARY KEY,
+                balance REAL NOT NULL,
+                initial_balance REAL NOT NULL,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    # Positions table: Stores currently held stocks
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS positions (
-            ticker TEXT PRIMARY KEY,
-            quantity INTEGER NOT NULL,
-            average_price REAL NOT NULL,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+        # Positions table: Stores currently held stocks
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS positions (
+                ticker TEXT PRIMARY KEY,
+                quantity INTEGER NOT NULL,
+                average_price REAL NOT NULL,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-    # Trades table: Logs all buy/sell transactions
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            ticker TEXT NOT NULL,
-            order_type TEXT NOT NULL, -- 'BUY' or 'SELL'
-            quantity INTEGER NOT NULL,
-            price REAL NOT NULL,
-            total_cost REAL NOT NULL -- (quantity * price)
-        )
-    """)
+        # Trades table: Logs all buy/sell transactions
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                ticker TEXT NOT NULL,
+                order_type TEXT NOT NULL, -- 'BUY' or 'SELL'
+                quantity INTEGER NOT NULL,
+                price REAL NOT NULL,
+                total_cost REAL NOT NULL -- (quantity * price)
+            )
+        """)
 
-    # Initialize account if it doesn't exist
-    cursor.execute("SELECT COUNT(*) FROM account")
-    if cursor.fetchone()[0] == 0:
-        initial_balance = 100000.00  # Starting paper money
-        cursor.execute("INSERT INTO account (balance, initial_balance) VALUES (?, ?)",
-                       (initial_balance, initial_balance))
-        print(f"Initialized account with ${initial_balance:,.2f}")
+        # Initialize account if it doesn't exist
+        cursor.execute("SELECT COUNT(*) FROM account")
+        if cursor.fetchone()[0] == 0:
+            initial_balance = 100000.00  # Starting paper money
+            cursor.execute("INSERT INTO account (balance, initial_balance) VALUES (?, ?)",
+                           (initial_balance, initial_balance))
+            print(f"Initialized account with ${initial_balance:,.2f}")
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+
     print("Database initialized successfully.")
 
 
-def get_connection():
-    """Returns a connection object to the database."""
-    return sqlite3.connect(DATABASE_FILE)
-
-
 def get_account_balance():
-    """Retrieves the current account balance."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT balance FROM account ORDER BY id LIMIT 1")
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else 0.0
+    """Retrieves the current account balance with caching."""
+    current_time = time.time()
+
+    # Check cache first
+    if current_time - _account_cache["timestamp"] < CACHE_TTL and _account_cache["data"] is not None:
+        return _account_cache["data"]
+
+    # Cache miss, query database
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT balance FROM account ORDER BY id LIMIT 1")
+        result = cursor.fetchone()
+        balance = result[0] if result else 0.0
+
+    # Update cache
+    _account_cache["timestamp"] = current_time
+    _account_cache["data"] = balance
+
+    return balance
 
 
 def update_account_balance(new_balance):
     """Updates the account balance."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE account SET balance = ?, last_updated = ? WHERE id = (SELECT id FROM account ORDER BY id LIMIT 1)",
-                   (new_balance, datetime.now()))
-    conn.commit()
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE account SET balance = ?, last_updated = ? WHERE id = (SELECT id FROM account ORDER BY id LIMIT 1)",
+                (new_balance, datetime.now())
+            )
+            conn.commit()
+
+            # Invalidate cache
+            _account_cache["timestamp"] = 0
+            return True
+        except sqlite3.Error as e:
+            print(f"Database error updating balance: {e}")
+            return False
 
 
 def log_trade(ticker, order_type, quantity, price):
     """Logs a trade into the trades table."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    total_cost = quantity * price
-    cursor.execute("""
-        INSERT INTO trades (ticker, order_type, quantity, price, total_cost, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (ticker, order_type, quantity, price, total_cost, datetime.now()))
-    conn.commit()
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        total_cost = quantity * price
+        try:
+            cursor.execute("""
+                INSERT INTO trades (ticker, order_type, quantity, price, total_cost, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (ticker, order_type, quantity, price, total_cost, datetime.now()))
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            print(f"Database error logging trade: {e}")
+            return False
 
 
 def get_position(ticker):
     """Retrieves the current position for a specific ticker."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT quantity, average_price FROM positions WHERE ticker = ?", (ticker,))
-    result = cursor.fetchone()
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT quantity, average_price FROM positions WHERE ticker = ?", (ticker,))
+        result = cursor.fetchone()
+
     return result if result else (0, 0.0)  # quantity, avg_price
 
 
 def update_position(ticker, new_quantity, new_average_price):
     """Updates or inserts a position."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    if new_quantity > 0:
-        # Use REPLACE INTO which is an SQLite extension (UPSERT)
-        # It deletes the old row (if exists based on PRIMARY KEY) and inserts the new one.
-        cursor.execute("""
-            REPLACE INTO positions (ticker, quantity, average_price, last_updated)
-            VALUES (?, ?, ?, ?)
-        """, (ticker, new_quantity, new_average_price, datetime.now()))
-        print(
-            f"Position updated for {ticker}: Qty={new_quantity}, AvgPrice={new_average_price:.2f}")
-    else:
-        # Remove position if quantity is zero or less
-        cursor.execute("DELETE FROM positions WHERE ticker = ?", (ticker,))
-        print(f"Position closed for {ticker}")
-    conn.commit()
-    conn.close()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            if new_quantity > 0:
+                # Use REPLACE INTO which is an SQLite extension (UPSERT)
+                # It deletes the old row (if exists based on PRIMARY KEY) and inserts the new one.
+                cursor.execute("""
+                    REPLACE INTO positions (ticker, quantity, average_price, last_updated)
+                    VALUES (?, ?, ?, ?)
+                """, (ticker, new_quantity, new_average_price, datetime.now()))
+                print(
+                    f"Position updated for {ticker}: Qty={new_quantity}, AvgPrice={new_average_price:.2f}")
+            else:
+                # Remove position if quantity is zero or less
+                cursor.execute(
+                    "DELETE FROM positions WHERE ticker = ?", (ticker,))
+                print(f"Position closed for {ticker}")
+
+            conn.commit()
+
+            # Invalidate positions cache
+            _positions_cache["timestamp"] = 0
+            return True
+        except sqlite3.Error as e:
+            print(f"Database error updating position: {e}")
+            return False
 
 
 def get_all_positions():
-    """Retrieves all current positions as a DataFrame."""
-    conn = get_connection()
-    # Use pandas read_sql for convenience
-    try:
-        df = pd.read_sql_query(
-            "SELECT ticker, quantity, average_price FROM positions", conn)
-    except Exception as e:
-        print(f"Error reading positions: {e}")
-        # Return empty df on error
-        df = pd.DataFrame(columns=['ticker', 'quantity', 'average_price'])
-    finally:
-        conn.close()
-    return df
+    """Retrieves all current positions as a DataFrame with caching."""
+    current_time = time.time()
+
+    # Check cache first
+    if current_time - _positions_cache["timestamp"] < CACHE_TTL and _positions_cache["data"] is not None:
+        return _positions_cache["data"].copy()
+
+    # Cache miss, query database
+    with get_db_connection() as conn:
+        try:
+            df = pd.read_sql_query(
+                "SELECT ticker, quantity, average_price FROM positions", conn)
+
+            # Update cache
+            _positions_cache["timestamp"] = current_time
+            _positions_cache["data"] = df.copy()
+
+            return df
+        except Exception as e:
+            print(f"Error reading positions: {e}")
+            # Return empty df on error
+            return pd.DataFrame(columns=['ticker', 'quantity', 'average_price'])
 
 
 def get_positions():
@@ -164,22 +222,27 @@ def get_positions():
             quantity = row['quantity']
             entry_price = row['average_price']
 
-            # Get current price for the ticker
+            # Get current price for the ticker (use cached price for better performance)
             try:
-                current_price = sd.get_latest_price(ticker) or entry_price
+                current_price = sd.get_cached_price(ticker) or entry_price
             except:
                 # If error getting price, use entry price
                 current_price = entry_price
 
             # Calculate position value and P/L
             position_value = quantity * current_price
+            pnl = position_value - (quantity * entry_price)
+            pnl_percent = (pnl / (quantity * entry_price)) * \
+                100 if entry_price > 0 else 0
 
             positions.append({
                 'symbol': ticker,
                 'quantity': quantity,
                 'entry_price': entry_price,
                 'current_price': current_price,
-                'position_value': position_value
+                'position_value': position_value,
+                'pnl': pnl,
+                'pnl_percent': pnl_percent
             })
 
         return positions
@@ -198,133 +261,146 @@ def get_account_info():
     - Profit/loss metrics
     """
     try:
-        # Get the cash balance
+        import trading_logic as tl  # Import here to avoid circular imports
+
+        # Get the account balance
         cash_balance = get_account_balance()
 
-        # Get initial balance for P/L calculation
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT initial_balance FROM account LIMIT 1")
-        initial_balance = cursor.fetchone()[0]
-        conn.close()
-
-        # Calculate portfolio value from positions
-        positions = get_positions()
-        portfolio_value = sum(pos['position_value'] for pos in positions)
+        # Get the portfolio value
+        portfolio_value = tl.get_portfolio_value()
 
         # Calculate total equity
         total_equity = cash_balance + portfolio_value
 
+        # Get initial balance for P/L calculation
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT initial_balance FROM account ORDER BY id LIMIT 1")
+            result = cursor.fetchone()
+            initial_balance = result[0] if result else 0.0
+
         # Calculate P/L
-        profit_loss = total_equity - initial_balance
-        profit_loss_pct = (profit_loss / initial_balance) * \
-            100 if initial_balance > 0 else 0
+        pnl = total_equity - initial_balance
+        pnl_percent = (pnl / initial_balance *
+                       100) if initial_balance > 0 else 0
 
         return {
-            'balance': cash_balance,
+            'cash_balance': cash_balance,
             'portfolio_value': portfolio_value,
             'total_equity': total_equity,
             'initial_balance': initial_balance,
-            'profit_loss': profit_loss,
-            'profit_loss_pct': profit_loss_pct,
-            'buying_power': cash_balance  # In a cash account, buying power equals cash balance
+            'pnl': pnl,
+            'pnl_percent': pnl_percent
         }
-
     except Exception as e:
-        print(f"Error in get_account_info: {e}")
-        # Return dummy data in case of error to prevent UI crashes
+        print(f"Error getting account info: {e}")
         return {
-            'balance': 0.0,
+            'cash_balance': 0.0,
             'portfolio_value': 0.0,
             'total_equity': 0.0,
-            'profit_loss': 0.0,
-            'profit_loss_pct': 0.0,
-            'buying_power': 0.0
+            'initial_balance': 0.0,
+            'pnl': 0.0,
+            'pnl_percent': 0.0
         }
 
 
-def get_trade_history():
+def get_trade_history(limit=100):
     """
-    Retrieves trade history in format suitable for the UI.
+    Retrieves the trade history ordered by most recent first.
+
+    Args:
+        limit (int): Maximum number of trades to retrieve
+
+    Returns:
+        list: List of trade dictionaries
     """
     try:
-        # Get trade history as DataFrame
-        history_df = pd.read_sql_query(
-            "SELECT id, timestamp, ticker, order_type, quantity, price FROM trades ORDER BY timestamp DESC",
-            get_connection()
-        )
+        with get_db_connection() as conn:
+            query = """
+                SELECT id, timestamp, ticker, order_type, quantity, price, total_cost
+                FROM trades
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """
+            df = pd.read_sql_query(query, conn, params=(limit,))
 
-        if history_df.empty:
-            return []
+            if df.empty:
+                return []
 
-        # Convert to list of dictionaries for UI
-        history = []
+            # Convert to list of dictionaries
+            trades = []
+            for _, row in df.iterrows():
+                trades.append({
+                    'id': row['id'],
+                    'timestamp': row['timestamp'],
+                    'symbol': row['ticker'],
+                    'side': row['order_type'],
+                    'quantity': row['quantity'],
+                    'price': row['price'],
+                    'total': row['total_cost']
+                })
 
-        for _, row in history_df.iterrows():
-            history.append({
-                'id': row['id'],
-                'timestamp': row['timestamp'],
-                'symbol': row['ticker'],
-                'side': row['order_type'].lower(),
-                'quantity': row['quantity'],
-                'price': row['price']
-            })
-
-        return history
-
+            return trades
     except Exception as e:
-        print(f"Error in get_trade_history: {e}")
+        print(f"Error getting trade history: {e}")
         return []
 
 
-# Original get_trade_history function renamed to get_trade_history_df to avoid collision
-def get_trade_history_df():
-    """Retrieves the trade history as a DataFrame."""
-    conn = get_connection()
-    try:
-        df = pd.read_sql_query(
-            "SELECT timestamp, ticker, order_type, quantity, price, total_cost FROM trades ORDER BY timestamp DESC", conn)
-        # Format timestamp for better readability if needed
-        if not df.empty:
-            df['timestamp'] = pd.to_datetime(
-                df['timestamp']).dt.strftime('%Y-%m-%d %H:%M:%S')
-    except Exception as e:
-        print(f"Error reading trade history: {e}")
-        df = pd.DataFrame(
-            columns=['timestamp', 'ticker', 'order_type', 'quantity', 'price', 'total_cost'])
-    finally:
-        conn.close()
-    return df
+def clear_cache():
+    """Clear all database caches"""
+    global _account_cache, _positions_cache
+    _account_cache = {"timestamp": 0, "data": None}
+    _positions_cache = {"timestamp": 0, "data": None}
+    print("Database cache cleared")
 
 
-if __name__ == '__main__':
-    print("Initializing DB for standalone test...")
+if __name__ == "__main__":
+    # Test initialization and basic operations
     initialize_database()
-    print(f"Initial Balance: ${get_account_balance():,.2f}")
 
-    # --- Example Interactions (for testing) ---
-    # Simulate buying 10 AAPL @ 150
-    # log_trade('AAPL', 'BUY', 10, 150.00)
-    # update_position('AAPL', 10, 150.00)
-    # update_account_balance(get_account_balance() - (10 * 150.00))
-    # print(f"Balance after buying AAPL: ${get_account_balance():,.2f}")
-    # print("Positions after buying AAPL:")
-    # print(get_all_positions())
+    print("\n--- Account Balance ---")
+    balance = get_account_balance()
+    print(f"Current balance: {format_currency(balance)}")
 
-    # Simulate selling 5 AAPL @ 160
-    # current_qty, avg_price = get_position('AAPL')
-    # if current_qty >= 5:
-    #    log_trade('AAPL', 'SELL', 5, 160.00)
-    #    update_position('AAPL', current_qty - 5, avg_price) # Avg price doesn't change on sell
-    #    update_account_balance(get_account_balance() + (5 * 160.00))
-    #    print(f"Balance after selling AAPL: ${get_account_balance():,.2f}")
-    #    print("Positions after selling AAPL:")
-    #    print(get_all_positions())
-    # else:
-    #    print("Not enough AAPL shares to sell.")
+    print("\n--- Positions ---")
+    positions = get_positions()
+    if positions:
+        for pos in positions:
+            print(f"{pos['symbol']}: {pos['quantity']} shares @ {format_currency(pos['entry_price'])}, "
+                  f"Current: {format_currency(pos['current_price'])}, "
+                  f"Value: {format_currency(pos['position_value'])}")
+    else:
+        print("No positions")
 
-    print("\nTrade History:")
-    print(get_trade_history())
-    print("\nFinal Positions:")
-    print(get_all_positions())
-    print(f"\nFinal Balance: ${get_account_balance():,.2f}")
+    print("\n--- Trade History ---")
+    trades = get_trade_history(5)
+    if trades:
+        for trade in trades:
+            print(f"{trade['timestamp']} - {trade['side']} {trade['quantity']} {trade['symbol']} @ "
+                  f"{format_currency(trade['price'])}, Total: {format_currency(trade['total'])}")
+    else:
+        print("No trade history")
+
+    print("\n--- Account Info ---")
+    info = get_account_info()
+    print(f"Cash: {format_currency(info['cash_balance'])}")
+    print(f"Portfolio: {format_currency(info['portfolio_value'])}")
+    print(f"Equity: {format_currency(info['total_equity'])}")
+    print(
+        f"P/L: {format_currency(info['pnl'])} ({format_percent(info['pnl_percent'])})")
+
+    print("\n--- Testing Cache ---")
+    start_time = time.time()
+    get_account_balance()  # First call, should hit database
+    first_time = time.time() - start_time
+
+    start_time = time.time()
+    get_account_balance()  # Second call, should hit cache
+    second_time = time.time() - start_time
+
+    print(f"First call: {first_time:.6f}s, Second call: {second_time:.6f}s")
+    if second_time > 0:
+        print(f"Cache speedup: {first_time/second_time:.1f}x")
+
+    clear_cache()  # Reset cache for normal operations

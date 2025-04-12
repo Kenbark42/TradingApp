@@ -2,8 +2,11 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime, timedelta
 import time  # Import time for potential retries or delays
+from utils import throttle, retry
 
 
+@throttle(seconds=0.5)  # Prevent potential rate limiting
+@retry(max_attempts=3, delay=1.0, backoff=2, exceptions=(Exception,))
 def fetch_stock_data(ticker_symbol, period="1mo", interval="1d"):
     """
     Fetches stock data for charting in the app. This is a wrapper around get_stock_data
@@ -32,6 +35,7 @@ def fetch_stock_data(ticker_symbol, period="1mo", interval="1d"):
         return pd.DataFrame()
 
 
+@throttle(seconds=0.5)  # Add throttling to prevent API rate limits
 def get_stock_data(ticker_symbol, period="5d", interval="5m"):
     """
     Fetches historical stock data for the given ticker symbol for a specified period and interval.
@@ -77,6 +81,8 @@ def get_stock_data(ticker_symbol, period="5d", interval="5m"):
         return None
 
 
+@throttle(seconds=0.5)  # Add throttling to prevent API rate limits
+@retry(max_attempts=3, delay=1.0, backoff=2, exceptions=(Exception,))
 def get_latest_price(ticker_symbol):
     """
     Fetches the most recent available price for a ticker symbol.
@@ -121,6 +127,40 @@ def get_latest_price(ticker_symbol):
         return None
 
 
+# Cache to store recently fetched prices with timestamps
+price_cache = {}
+CACHE_TTL = 60  # Time-to-live in seconds for cached prices
+
+
+def get_cached_price(ticker_symbol, max_age_seconds=CACHE_TTL):
+    """
+    Get a cached price if available and not too old, otherwise fetch a new one
+
+    Args:
+        ticker_symbol (str): The stock ticker symbol
+        max_age_seconds (int): Maximum age in seconds for cached data
+
+    Returns:
+        float: The latest price, or None if fetching fails
+    """
+    current_time = time.time()
+
+    # Check if we have a cached price and it's recent enough
+    if ticker_symbol in price_cache:
+        timestamp, price = price_cache[ticker_symbol]
+        if current_time - timestamp < max_age_seconds:
+            return price
+
+    # Fetch a new price
+    price = get_latest_price(ticker_symbol)
+
+    # Cache the result if successful
+    if price is not None:
+        price_cache[ticker_symbol] = (current_time, price)
+
+    return price
+
+
 if __name__ == '__main__':
     # Example usage:
     print("\n--- Fetching Intraday Data (MSFT 1 day, 5 min interval) ---")
@@ -136,17 +176,30 @@ if __name__ == '__main__':
         print(googl_data.tail())
 
     print("\n--- Fetching Latest Prices ---")
-    latest_aapl = get_latest_price("AAPL")
+    latest_aapl = get_cached_price("AAPL")
     if latest_aapl:
         print(f"Latest AAPL Price: {latest_aapl:.2f}")
 
-    latest_invalid = get_latest_price("INVALIDTICKERXYZ")
+    latest_invalid = get_cached_price("INVALIDTICKERXYZ")
     if latest_invalid is None:
         print("Successfully handled invalid ticker for latest price.")
 
     # Example for a potentially less common ticker
-    latest_pton = get_latest_price("PTON")
+    latest_pton = get_cached_price("PTON")
     if latest_pton:
         print(f"Latest PTON Price: {latest_pton:.2f}")
     else:
         print("Could not fetch latest price for PTON.")
+
+    # Test caching
+    print("\n--- Testing Price Caching ---")
+    start = time.time()
+    price1 = get_cached_price("MSFT")
+    time1 = time.time() - start
+
+    start = time.time()
+    price2 = get_cached_price("MSFT")  # Should be cached
+    time2 = time.time() - start
+
+    print(
+        f"First fetch: {time1:.4f}s, Second fetch: {time2:.4f}s, Speedup: {time1/time2:.1f}x")
