@@ -336,18 +336,24 @@ class TreeviewPanel:
                   background=[('selected', colors["accent_button_bg"])],
                   foreground=[('selected', colors["accent_button_fg"])])
 
-        # Set up alternating row colors
+        # Set up alternating row colors and profit/loss colors
         if tree:
             # Create even and odd tags
             tree.tag_configure('even', background=colors["bg_widget"])
             tree.tag_configure('odd', background=colors["bg_accent"])
 
+            # Configure gain/loss tags for profit/loss coloring
+            tree.tag_configure('gain', foreground=colors["gain"])
+            tree.tag_configure('loss', foreground=colors["loss"])
+
             # Apply tags to existing rows
             items = tree.get_children()
             for i, item in enumerate(items):
                 tag = 'even' if i % 2 == 0 else 'odd'
-                values = tree.item(item, 'values')
-                tree.item(item, tags=(tag,))
+                # Keep any existing tags like gain/loss
+                current_tags = tree.item(item, 'tags')
+                if current_tags and len(current_tags) > 1:
+                    tree.item(item, tags=(tag, current_tags[1]))
 
     def create_frame(self, title, icon="📊"):
         """Create a modern card-like frame for a treeview"""
@@ -377,8 +383,11 @@ class TreeviewPanel:
 class PositionsPanel(TreeviewPanel):
     """Panel for displaying current positions"""
 
-    def __init__(self, parent, appearance_mode):
+    def __init__(self, parent, appearance_mode, update_callback=None):
         super().__init__(parent, appearance_mode)
+        self.update_callback = update_callback
+        self.auto_refresh_enabled = ctk.BooleanVar(value=False)
+        self.refresh_interval = ctk.IntVar(value=10)  # seconds
         self.create_widgets()
 
     def create_widgets(self):
@@ -389,9 +398,77 @@ class PositionsPanel(TreeviewPanel):
         colors = COLORS["dark"] if self.appearance_mode.get(
         ) == 'dark' else COLORS["light"]
 
+        # Add refresh controls above the treeview
+        controls_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        controls_frame.grid(row=2, column=0, sticky="ew", padx=15, pady=(0, 5))
+        controls_frame.grid_columnconfigure(0, weight=1)
+        controls_frame.grid_columnconfigure(1, weight=0)
+
+        # Auto-refresh toggle with label
+        auto_refresh_frame = ctk.CTkFrame(
+            controls_frame, fg_color="transparent")
+        auto_refresh_frame.grid(row=0, column=0, sticky="w")
+
+        refresh_label = ctk.CTkLabel(
+            auto_refresh_frame,
+            text="Auto-refresh:",
+            font=ctk.CTkFont(family="Segoe UI", size=10),
+            text_color=colors["fg_accent"]
+        )
+        refresh_label.grid(row=0, column=0, padx=(0, 5))
+
+        auto_refresh_toggle = ctk.CTkSwitch(
+            auto_refresh_frame,
+            text="",
+            variable=self.auto_refresh_enabled,
+            command=self.toggle_auto_refresh,
+            width=40,
+            height=18
+        )
+        auto_refresh_toggle.grid(row=0, column=1, padx=(0, 5))
+
+        interval_label = ctk.CTkLabel(
+            auto_refresh_frame,
+            text="Interval:",
+            font=ctk.CTkFont(family="Segoe UI", size=10),
+            text_color=colors["fg_accent"]
+        )
+        interval_label.grid(row=0, column=2, padx=(5, 5))
+
+        interval_dropdown = ctk.CTkOptionMenu(
+            auto_refresh_frame,
+            values=["5", "10", "15", "30", "60"],
+            variable=self.refresh_interval,
+            command=self.change_interval,
+            width=60,
+            height=20,
+            font=ctk.CTkFont(family="Segoe UI", size=10)
+        )
+        interval_dropdown.grid(row=0, column=3, padx=(0, 5))
+
+        seconds_label = ctk.CTkLabel(
+            auto_refresh_frame,
+            text="seconds",
+            font=ctk.CTkFont(family="Segoe UI", size=10),
+            text_color=colors["fg_accent"]
+        )
+        seconds_label.grid(row=0, column=4, padx=(0, 5))
+
+        # Manual refresh button
+        refresh_button = ctk.CTkButton(
+            controls_frame,
+            text="↻",
+            width=25,
+            height=25,
+            command=self.manual_refresh,
+            corner_radius=5,
+            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold")
+        )
+        refresh_button.grid(row=0, column=1, padx=(0, 0), sticky="e")
+
         # Create treeview for positions inside a container frame for proper scrollbar positioning
         tree_container = ctk.CTkFrame(frame, fg_color="transparent")
-        tree_container.grid(row=2, column=0, sticky="nsew",
+        tree_container.grid(row=3, column=0, sticky="nsew",
                             padx=15, pady=(0, 15))
         tree_container.grid_columnconfigure(0, weight=1)
         tree_container.grid_rowconfigure(0, weight=1)
@@ -436,6 +513,30 @@ class PositionsPanel(TreeviewPanel):
 
         # Apply modern styling
         self.apply_treeview_style()
+
+    def toggle_auto_refresh(self):
+        """Toggle auto-refresh state and start/stop timer"""
+        if self.update_callback:
+            if self.auto_refresh_enabled.get():
+                self.update_callback(True, self.refresh_interval.get())
+            else:
+                self.update_callback(False)
+
+    def change_interval(self, interval):
+        """Update the refresh interval"""
+        try:
+            # Update interval variable
+            self.refresh_interval.set(int(interval))
+            # If auto-refresh is enabled, restart timer with new interval
+            if self.auto_refresh_enabled.get() and self.update_callback:
+                self.update_callback(True, self.refresh_interval.get())
+        except ValueError:
+            pass
+
+    def manual_refresh(self):
+        """Trigger a manual refresh"""
+        if self.update_callback:
+            self.update_callback(single=True)
 
 
 class HistoryPanel(TreeviewPanel):

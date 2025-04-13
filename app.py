@@ -40,11 +40,15 @@ class TradingApp(ctk.CTk):
             self.scan_interval = ctk.IntVar(value=15)  # minutes
             self.risk_level = ctk.StringVar(value="medium")
             self.autotrade_timer = None  # For tracking the scheduled task
+            self.position_refresh_timer = None  # For tracking position updates
 
             # Set up window
             self.title("AlgoTrade Simulator - Paper Trading Platform")
             self.geometry(DEFAULT_WINDOW_SIZE)
             print("Window configured")
+
+            # Protocol for window closing
+            self.protocol("WM_DELETE_WINDOW", self.on_closing)
 
             # --- Create Menu ---
             self.create_menu()
@@ -168,7 +172,8 @@ class TradingApp(ctk.CTk):
 
         self.positions_panel = PositionsPanel(
             positions_tab,
-            self.appearance_mode
+            self.appearance_mode,
+            self.handle_position_refresh
         )
 
         # History panel
@@ -670,10 +675,6 @@ class TradingApp(ctk.CTk):
             # Get current positions from database
             positions = db.get_positions()
 
-            # Get current theme colors
-            colors = COLORS["dark"] if self.appearance_mode.get(
-            ) == 'dark' else COLORS["light"]
-
             # Add positions to treeview
             for i, position in enumerate(positions):
                 symbol = position['symbol']
@@ -681,28 +682,26 @@ class TradingApp(ctk.CTk):
                 entry_price = position['entry_price']
                 current_price = position['current_price']
                 position_value = position['position_value']
-
-                # Calculate P/L
                 pnl = position['pnl']
                 pnl_percent = position['pnl_percent']
 
-                # Format for display
-                pnl_str = f"{'+' if pnl >= 0 else ''}{pnl:.2f}"
-                pnl_percent_str = f"{'+' if pnl_percent >= 0 else ''}{pnl_percent:.2f}%"
-
-                # Add row to treeview with appropriate tag for coloring
+                # Add row to treeview with alternating colors
                 tag = 'even' if i % 2 == 0 else 'odd'
+                profit_tag = 'gain' if pnl >= 0 else 'loss'
                 self.positions_tree.insert('', 'end', values=(
                     symbol,
                     quantity,
                     f"${entry_price:.2f}",
                     f"${current_price:.2f}",
                     f"${position_value:.2f}",
-                    pnl_str,
-                    pnl_percent_str
-                ), tags=(tag,))
+                    f"${pnl:.2f}",
+                    f"{pnl_percent:.2f}%"
+                ), tags=(tag, profit_tag))
 
-            self.add_status_message("Positions updated")
+            # Add status message if auto-refresh is enabled
+            if self.positions_panel.auto_refresh_enabled.get():
+                current_time = time.strftime("%H:%M:%S", time.localtime())
+                self.add_status_message(f"Positions updated at {current_time}")
 
         except Exception as e:
             self.add_status_message(
@@ -748,6 +747,66 @@ class TradingApp(ctk.CTk):
     def add_status_message(self, message, error=False):
         """Add a message to the status text widget with timestamp"""
         self.status_panel.add_message(message, error)
+
+    def handle_position_refresh(self, enabled=False, interval=10, single=False):
+        """Handle position refresh timer management"""
+        # Cancel any existing timer
+        if self.position_refresh_timer:
+            self.after_cancel(self.position_refresh_timer)
+            self.position_refresh_timer = None
+
+        # For a single manual refresh
+        if single:
+            self.update_positions_display()
+            self.add_status_message("Positions manually refreshed")
+            return
+
+        # For auto-refresh
+        if enabled:
+            # Convert interval to milliseconds
+            interval_ms = interval * 1000
+
+            # Start the first refresh
+            self.update_positions_display()
+            self.add_status_message(
+                f"Auto-refresh enabled: updating every {interval} seconds")
+
+            # Schedule next refresh
+            self.position_refresh_timer = self.after(
+                interval_ms, lambda: self.schedule_next_refresh(interval_ms))
+        else:
+            self.add_status_message("Auto-refresh disabled")
+
+    def schedule_next_refresh(self, interval_ms):
+        """Schedule the next position refresh"""
+        # Update positions
+        self.update_positions_display()
+
+        # Schedule next update if auto-refresh is still enabled
+        if self.positions_panel.auto_refresh_enabled.get():
+            self.position_refresh_timer = self.after(
+                interval_ms, lambda: self.schedule_next_refresh(interval_ms))
+        else:
+            self.position_refresh_timer = None
+
+    def on_closing(self):
+        """Handle application cleanup when closing"""
+        try:
+            # Cancel any active timers
+            if self.autotrade_timer:
+                self.after_cancel(self.autotrade_timer)
+
+            if self.position_refresh_timer:
+                self.after_cancel(self.position_refresh_timer)
+
+            # Close database connections
+            db.clear_cache()
+
+            # Destroy the window
+            self.destroy()
+        except Exception as e:
+            print(f"Error during cleanup: {e}")
+            self.destroy()
 
 
 if __name__ == "__main__":
